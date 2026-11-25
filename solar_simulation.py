@@ -16,8 +16,12 @@ Architecture
   BLOCK 8 : GitHub output       — writes JSON to local repo path for Pages
   BLOCK 9 : Main orchestration
 
-No calibration factors are applied anywhere in this script.
-Accuracy will be improved after validation against measured data.
+Each site has one correction factor, `system_derating` (Block 1), for real-world
+losses the physics does not capture. 1.0 means "not yet validated".
+
+Solar Guardian credentials are read from the SG_APP_KEY and SG_APP_SECRET
+environment variables (GitHub secrets in the hourly workflow). They are never
+written in this file. Without them the script still runs, using FALLBACK_SOC.
 """
 
 import os
@@ -188,6 +192,10 @@ LOCATIONS = [
         "mppt_max_power_w":      4800.0,
         "inverter_cont_power_w": 5000.0,
         "inverter_idle_w":       24.0,
+        # CP1 and CP2 share one Solar Guardian station. Set this to CP1's device
+        # name exactly as the log prints it ("Clyde Cycle Park / <device>") so
+        # each controller gets its own battery level.
+        "solar_guardian_device": None,
         "always_on_load_w":      0.0,           # no confirmed always-on load at CP1
         "inverter_eff_full":     0.91,
         "inverter_eff_third":    0.94,
@@ -212,6 +220,7 @@ LOCATIONS = [
         "mppt_max_power_w":      4800.0,
         "inverter_cont_power_w": 5000.0,
         "inverter_idle_w":       24.0,
+        "solar_guardian_device": None,          # set to CP2's device name — see CP1
         "always_on_load_w":      13.0,          # fridge CTT50W12 confirmed 12.3W avg
         "inverter_eff_full":     0.91,
         "inverter_eff_third":    0.94,
@@ -223,7 +232,9 @@ LOCATIONS = [
 FORECAST_DAYS   = 7        # how many days ahead to simulate
 ALBEDO          = 0.20
 G_SC            = 1367     # solar constant W/m²
-FALLBACK_SOC    = 0.50     # 50% of usable capacity = 75% EPEVER total SOC — mid-range fallback
+# Used when no live SOC is available. Fraction of TOTAL capacity, like the
+# EPEVER display: 0.75 total = half of the usable range (the floor is 0.50).
+FALLBACK_SOC    = 0.75
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -234,8 +245,10 @@ FALLBACK_SOC    = 0.50     # 50% of usable capacity = 75% EPEVER total SOC — m
 # EPSolar cloud API. Falls back to FALLBACK_SOC if unavailable.
 # ────────────────────────────────────────────────────────────────────
 
-SOLAR_GUARDIAN_APP_KEY    = os.getenv("SG_APP_KEY",    "U7xlAHiw")
-SOLAR_GUARDIAN_APP_SECRET = os.getenv("SG_APP_SECRET", "5243hnuqlhw1i4ff65oh8nxrk167p0wh")
+# Never put real values here — set SG_APP_KEY / SG_APP_SECRET as environment
+# variables (locally) or GitHub repository secrets (hourly workflow).
+SOLAR_GUARDIAN_APP_KEY    = os.getenv("SG_APP_KEY", "")
+SOLAR_GUARDIAN_APP_SECRET = os.getenv("SG_APP_SECRET", "")
 SOLAR_GUARDIAN_BASE_URL   = "https://openapi.epsolarpv.com"
 SOLAR_GUARDIAN_HISTORY_URL = f"{SOLAR_GUARDIAN_BASE_URL}:7002/history/lastDatapoint"
 
@@ -345,13 +358,24 @@ def _sg_fetch_last_soc(token: str, point: Dict) -> Optional[float]:
     return None
 
 
+def soc_key(station: str, device: Optional[str] = None) -> str:
+    """Key used in the live-SOC map: 'Station' or 'Station / Device'."""
+    return f"{station} / {device}" if device else station
+
+
 def fetch_live_soc() -> Dict[str, float]:
     """
-    Returns a dict mapping solar_guardian_name → SOC (0–100).
-    Any site that fails returns FALLBACK_SOC * 100.
+    Returns a dict of SOC readings (0–100), keyed two ways:
+      'Station / Device' — one entry per charge controller
+      'Station'          — the station's first controller (for single-controller sites)
+    Sites missing from the dict fall back to FALLBACK_SOC.
     """
     print("\n[Block 2] Fetching live SOC from Solar Guardian API ...")
     soc_map: Dict[str, float] = {}
+
+    if not (SOLAR_GUARDIAN_APP_KEY and SOLAR_GUARDIAN_APP_SECRET):
+        print("  SG_APP_KEY / SG_APP_SECRET not set — using fallback SOC for all sites.")
+        return soc_map
 
     token = _sg_get_token()
     if not token:
@@ -369,10 +393,11 @@ def fetch_live_soc() -> Dict[str, float]:
                 continue
             soc = _sg_fetch_last_soc(token, point)
             if soc is not None:
-                # Key by station name — will be matched to loc["solar_guardian_name"]
-                soc_map[station["name"]] = float(soc)
-                print(f"  {station['name']} / {device['name']}: SOC = {soc:.1f}%")
-                break   # one device per station is enough for SOC
+                # Every controller gets its own entry, so stations with two
+                # controllers (Clyde CP1 + CP2) are not merged into one.
+                soc_map[soc_key(station["name"], device["name"])] = float(soc)
+                soc_map.setdefault(station["name"], float(soc))
+                print(f"  {soc_key(station['name'], device['name'])}: SOC = {soc:.1f}%")
 
     return soc_map
 
@@ -627,28 +652,28 @@ def simulate_battery(loc: Dict, pv_series: pd.Series,
     Returns
     -------
     Dict with:
-      soc_pct   : pd.Series of hourly SOC (%)
-      pv_w      : pd.Series of effective PV output (W, capped at full charge)
-      daily     : Dict of per-day summaries
+      soc_pct   : pd.Series of hourly SOC (% of total, EPEVER convention)
+      pv_w      : pd.Series of PV actually used (W): load + battery charging.
+                  Lower than pv_series when the battery is full (curtailed).
+      daily     : Dict of per-day summaries (gen_kwh = used, available_kwh)
     """
-    # Work in TOTAL capacity — so EPEVER SOC % maps directly (0-100% of total).
-    # The DoD floor is 50% of total (AGM 50% DoD recommendation).
-    # This means:
-    #   soc_kwh ranges from dod_floor_kwh (50% total) to total_cap (100% total)
-    #   soc_pct output = soc_kwh / total_cap * 100  → matches EPEVER display exactly
-    usable_cap   = loc["battery_usable_kwh"]   # kept for compatibility
+    # SOC is tracked as a FRACTION of the battery's effective capacity, like the
+    # EPEVER display: 1.0 = full, 0.5 = the DoD floor (AGM, 50% depth of discharge).
+    # Cold weather shrinks the effective capacity (battery_cold_derate), but a full
+    # battery still reads 100% — the controller's display works the same way.
+    usable_cap   = loc["battery_usable_kwh"]
     total_cap    = usable_cap * 2.0              # total = 2× usable (50% DoD)
-    dod_floor    = total_cap * 0.50              # never discharge below 50% of total
+    floor_frac   = 0.50                          # never discharge below 50% of total
     rte          = loc["battery_rte"]
     idle_kw      = loc["inverter_idle_w"] / 1000.0
     local_idx    = pv_series.index.tz_convert("Europe/London")
 
-    soc_kwh = total_cap * initial_soc_frac       # seed from EPEVER % of total
-    soc_arr = np.zeros(len(pv_series))
-    pv_eff  = np.zeros(len(pv_series))
-    daily   = {}
+    soc_frac = min(1.0, max(floor_frac, initial_soc_frac))   # seed from EPEVER %
+    soc_arr  = np.zeros(len(pv_series))
+    pv_used  = np.zeros(len(pv_series))
+    daily    = {}
 
-    # Track day boundaries to reset SOC on day 3+ to 50% (worst-case assumption)
+    # From day 3 on, reset SOC each midnight to a cautious mid-range value
     today_utc    = pd.Timestamp.now(tz="UTC").normalize()
     day3_cutoff  = today_utc + pd.Timedelta(days=2)   # start of day 3
     current_date = None
@@ -657,82 +682,62 @@ def simulate_battery(loc: Dict, pv_series: pd.Series,
         date_str = str(ts_local.date())
         hour_dec = ts_local.hour + ts_local.minute / 60.0
 
-        # At the start of each new day beyond day 2, reset SOC to 50%
-        # This reflects worst-case battery state for longer-range forecasts
         if date_str != current_date:
             current_date = date_str
             if ts_utc >= day3_cutoff and hour_dec < 1.0:
-                soc_kwh = total_cap * 0.75  # 75% total = ~50% usable = mid-range worst case
+                soc_frac = 0.75   # 75% total = 50% of the usable range
 
-        # Cold derate on capacity
-        bat_temp   = float(irr_df.loc[ts_utc, "Tamb"])
-        # eff_cap: maximum charge level (total_cap derated for cold)
-        # dod_floor: minimum charge level (50% of total, also derated)
-        derate_factor = _cold_derate_factor(bat_temp, loc)
-        eff_cap    = total_cap    * derate_factor
-        eff_usable = eff_cap - (total_cap * 0.50 * derate_factor)  # usable range after derate
-        dod_floor_eff = total_cap * 0.50 * derate_factor
+        # Effective capacity this hour (cold derate)
+        bat_temp = float(irr_df.loc[ts_utc, "Tamb"])
+        eff_cap  = total_cap * _cold_derate_factor(bat_temp, loc)
+        floor_kwh = eff_cap * floor_frac
+        soc_kwh   = soc_frac * eff_cap
 
-        # Maximum PV the array could produce this hour (uncurtailed MPPT output)
-        pv_max_kw  = pv_series.iloc[i] / 1000.0
-        mppt_max_kw = loc["mppt_max_power_w"] / 1000.0
+        # PV the array can deliver this hour (already MPPT- and inverter-limited)
+        pv_avail_kw = pv_series.iloc[i] / 1000.0
 
         # Background load runs 24/7: inverter idle + confirmed always-on appliances.
-        # always_on_load_w is site-specific (e.g. fridge at CP2 = 13W confirmed).
-        # Validated: winter overnight drop implies ~37W for CP2 (24W+13W = 37W ✓)
-        always_on_kw = loc.get("always_on_load_w", 0.0) / 1000.0
-        idle_this    = idle_kw + always_on_kw
-        load_kw      = idle_this
+        # Validated: winter overnight drop implies ~37W for CP2 (24W+13W = 37W)
+        load_kw = idle_kw + loc.get("always_on_load_w", 0.0) / 1000.0
 
-        battery_full = soc_kwh >= eff_cap * 0.99
+        # ── Charge controller ────────────────────────────────────────────────
+        # PV serves the load first. Any surplus charges the battery, but only
+        # as much as the battery can still take: once it is full the controller
+        # curtails the rest (that energy is never generated). This one rule
+        # covers all three EPEVER states seen in the measured data:
+        #   bulk       — battery not full: surplus charges it
+        #   float      — full, load > PV: battery covers the shortfall
+        #   float/free — full, load <= PV: PV covers the load, rest curtailed
+        pv_to_load   = min(pv_avail_kw, load_kw)
+        shortfall    = load_kw - pv_to_load
+        surplus      = pv_avail_kw - pv_to_load
+        headroom_kwh = max(0.0, eff_cap - soc_kwh)
+        charge_kwh   = min(surplus * rte, headroom_kwh)     # energy stored (1 h step)
+        pv_to_batt   = charge_kwh / rte if rte > 0 else 0.0
+        gen_kw       = pv_to_load + pv_to_batt              # PV actually used
 
-        if not battery_full:
-            # ── State 1: BULK CHARGING ────────────────────────────────────────
-            # Controller outputs maximum MPPT. Load and battery share output
-            # in parallel. Battery gets whatever PV can't supply to the load.
-            gen_kw     = pv_max_kw
-            pv_to_load = min(gen_kw, load_kw)
-            net_kwh    = (gen_kw - pv_to_load) * rte - max(0.0, load_kw - pv_to_load)
-        else:
-            # Battery is full — controller is in float/absorption mode.
-            # When a load appears, the controller can ramp back toward bulk
-            # up to its MPPT maximum to serve that load.
-            #
-            # ── State 2 & 3: FLOAT + LOAD ─────────────────────────────────────
-            # The controller ramps up to cover the load first, then any surplus
-            # goes to the battery. If load > what PV can supply, battery covers
-            # the deficit (State 2). If load ≤ PV available, battery barely moves
-            # (State 3 — "free energy", controller was curtailing anyway).
-            pv_available  = min(pv_max_kw, mppt_max_kw)   # what controller can deliver
-            pv_to_load    = min(pv_available, load_kw)     # PV covers load first
-            pv_surplus    = pv_available - pv_to_load      # any remainder to battery
-            bat_discharge = max(0.0, load_kw - pv_to_load) # battery only covers shortfall
+        soc_kwh  = max(floor_kwh, min(eff_cap, soc_kwh + charge_kwh - shortfall))
+        soc_frac = soc_kwh / eff_cap if eff_cap > 0 else floor_frac
 
-            gen_kw  = pv_to_load + pv_surplus              # total PV delivered
-            net_kwh = pv_surplus * rte - bat_discharge
-
-        soc_kwh = max(dod_floor_eff, min(eff_cap, soc_kwh + net_kwh))
-
-        soc_arr[i] = soc_kwh
-        pv_eff[i]  = gen_kw * 1000.0
+        soc_arr[i] = soc_frac * 100.0
+        pv_used[i] = gen_kw * 1000.0
 
         # Daily stats
         if date_str not in daily:
-            daily[date_str] = {"gen_kwh": 0.0, "full_charge_hour": None}
-        daily[date_str]["gen_kwh"] += gen_kw
+            daily[date_str] = {"gen_kwh": 0.0, "available_kwh": 0.0,
+                               "full_charge_hour": None}
+        daily[date_str]["gen_kwh"]       += gen_kw
+        daily[date_str]["available_kwh"] += pv_avail_kw
 
         if (daily[date_str]["full_charge_hour"] is None
-                and soc_kwh >= eff_cap * 0.99
-                and gen_kw > 0.0          # only record when solar is actively charging
+                and soc_frac >= 0.99
+                and pv_avail_kw > 0.0     # only record when solar is actively charging
                 and hour_dec >= 5.0):     # ignore midnight/pre-dawn artefacts
             daily[date_str]["full_charge_hour"] = round(hour_dec, 2)
 
-    soc_pct = pd.Series(soc_arr / total_cap * 100.0,  # 0-100% of total, matches EPEVER
-                        index=pv_series.index, name="soc_pct")
-
     return {
-        "soc_pct": soc_pct,
-        "pv_w":    pd.Series(pv_eff, index=pv_series.index, name="pv_w"),
+        "soc_pct": pd.Series(soc_arr, index=pv_series.index, name="soc_pct"),
+        "pv_w":    pd.Series(pv_used, index=pv_series.index, name="pv_w"),
         "daily":   daily,
     }
 
@@ -930,11 +935,13 @@ def build_output_payload(results: List[Dict], generated_at: str) -> Dict:
                     mean_gti      = fc_inputs["mean_gti"],
                     bat_temp      = fc_inputs["bat_temp"],
                 )
-            # Weather icon from gen_kwh vs theoretical max
+            # Weather icon from AVAILABLE solar vs theoretical max — not from
+            # gen_kwh, which drops on sunny days once the battery is full.
             # Theoretical max = capacity_kw * 8 daylight hours * 0.85 efficiency
             cap_kw       = loc["capacity"]
             theo_max_kwh = cap_kw * 8 * 0.85
-            gen_ratio    = bat_day["gen_kwh"] / theo_max_kwh if theo_max_kwh > 0 else 0
+            avail_kwh    = bat_day.get("available_kwh", bat_day["gen_kwh"])
+            gen_ratio    = avail_kwh / theo_max_kwh if theo_max_kwh > 0 else 0
             if gen_ratio > 0.70:   weather_icon = "sunny"
             elif gen_ratio > 0.45: weather_icon = "partly_cloudy"
             elif gen_ratio > 0.20: weather_icon = "cloudy"
@@ -942,7 +949,8 @@ def build_output_payload(results: List[Dict], generated_at: str) -> Dict:
 
             daily_out.append({
                 "date":              date_str,
-                "gen_kwh":           round(bat_day["gen_kwh"], 3),
+                "gen_kwh":           round(bat_day["gen_kwh"], 3),        # PV used
+                "available_kwh":     round(bat_day.get("available_kwh", 0.0), 3),  # PV possible
                 "full_charge_time":  _decimal_hour_to_str(bat_day.get("full_charge_hour")),
                 "fc_model_time":     fc_pred["time_str"]   if fc_pred else None,
                 "fc_confidence":     fc_pred["confidence"] if fc_pred else None,
@@ -1048,20 +1056,33 @@ def run():
     for loc in LOCATIONS:
         print(f"\n── {loc['name']}  ({loc['capacity']:.2f} kWp) ──────────────────────────")
 
-        # Resolve initial SOC
-        sg_name = loc.get("solar_guardian_name", loc["name"])
-        if sg_name in live_soc:
-            epever_soc_pct = live_soc[sg_name]
-            # Pass EPEVER SOC directly — it is 0-100% of TOTAL capacity.
-            # The battery model uses total_kwh as its reference (see simulate_battery).
-            initial_soc_frac = epever_soc_pct / 100.0
-            # Note: -1.0 because 50% EPEVER = 0% usable (bottom of our range)
-            # 50/100 * 2.0 - 1.0 = 0.0  ✓
-            # 100/100 * 2.0 - 1.0 = 1.0  ✓
-            # 75/100 * 2.0 - 1.0 = 0.5   ✓
-            # 23/100 * 2.0 - 1.0 = -0.54 → clamped to 0.0 (over-discharge) ✓
-            soc_source       = "api"
-            print(f"  SOC from API  : {live_soc[sg_name]:.1f}%")
+        # Resolve initial SOC — per controller where a device name is set
+        sg_name   = loc.get("solar_guardian_name", loc["name"])
+        sg_device = loc.get("solar_guardian_device")
+        device_key = soc_key(sg_name, sg_device)
+        shared = sum(1 for l in LOCATIONS
+                     if l.get("solar_guardian_name", l["name"]) == sg_name) > 1
+
+        if sg_device and device_key in live_soc:
+            soc_key_used, soc_source = device_key, "api"
+        elif sg_name in live_soc:
+            soc_key_used = sg_name
+            # A station shared by two controllers without a device name set
+            # gives both sites the same reading — flag it in the output.
+            soc_source = "api_shared" if shared else "api"
+            if sg_device:
+                print(f"  WARNING: device '{sg_device}' not found; using station reading")
+            elif shared:
+                print(f"  WARNING: '{sg_name}' has several controllers — set "
+                      f"solar_guardian_device for {loc['name']} (see device names above)")
+        else:
+            soc_key_used = None
+
+        if soc_key_used:
+            # EPEVER SOC is 0–100% of TOTAL capacity (DoD floor at 50%).
+            # simulate_battery() works in the same convention.
+            initial_soc_frac = live_soc[soc_key_used] / 100.0
+            print(f"  SOC from API  : {live_soc[soc_key_used]:.1f}%  ({soc_key_used})")
         else:
             initial_soc_frac = FALLBACK_SOC
             soc_source       = "fallback"

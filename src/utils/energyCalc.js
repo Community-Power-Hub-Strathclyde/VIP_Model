@@ -122,7 +122,10 @@ export function calcAvailableEnergy(
     const deltaHours = Math.max(0, (Math.min(24 * 60, nextMins) - rowMins) / 60);
     if (deltaHours <= 0) continue;
 
-    const pvW          = row.pv_power_w ?? 0;
+    // Use the solar the panels COULD deliver: when the battery is full, pv_power_w
+    // is only what the background load used, but the controller ramps up to
+    // serve any extra load (the "free energy" state).
+    const pvW          = row.pv_available_w ?? row.pv_power_w ?? 0;
     const activeW      = activeLoadWattsAt(rowMins);
     const totalLoadW   = backgroundLoadW + activeW;
 

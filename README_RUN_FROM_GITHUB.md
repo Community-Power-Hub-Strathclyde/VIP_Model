@@ -108,7 +108,7 @@ The JSON hasn't been regenerated. Run `python3 solar_simulation.py` and refresh.
 `useSimulator.js` must stay in `src/context/useSimulator.js` as a separate file from `SimulatorContext.jsx`. Vite Fast Refresh cannot handle a file that exports both a React component and a hook. Do not merge them.
 
 ### Python script fails to fetch SOC
-The Solar Guardian API may be unavailable. The script falls back to `FALLBACK_SOC = 0.50` (50% total capacity) automatically — this is expected and the simulation will still run.
+The Solar Guardian API may be unavailable, or the `SG_APP_KEY` / `SG_APP_SECRET` environment variables may not be set (they are never stored in the code). The script falls back to `FALLBACK_SOC = 0.75` (75% of total capacity) automatically — the simulation still runs.
 
 ### `AUTO_PUSH = False` in `solar_simulation.py`
 The script can commit and push the JSON automatically, but this is currently disabled. To update the live dashboard, manually commit and push `docs/data/simulation_output.json` after running the simulation.

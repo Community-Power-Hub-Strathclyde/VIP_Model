@@ -4,10 +4,11 @@ function getUserAlerts(prediction, currentHourData) {
   const alerts = [];
   if (!prediction) return alerts;
 
-  const { daily_gti_kwh, predicted_full_charge_time } = prediction;
+  const { predicted_full_charge_time } = prediction;
   const soc = currentHourData?.soc ?? 100;
 
-  if (!predicted_full_charge_time && daily_gti_kwh < 1.5) {
+  // Battery model says the battery won't fill today
+  if (!predicted_full_charge_time) {
     alerts.push({
       icon: '☁️',
       title: 'Poor solar day',

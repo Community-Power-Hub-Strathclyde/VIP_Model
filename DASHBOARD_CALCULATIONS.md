@@ -64,11 +64,13 @@ EPEVER 50%  →  0% usable   (DoD floor — never discharge below this)
 EPEVER 100% →  100% usable (fully charged)
 ```
 
-SOC seeding formula:
+SOC seeding:
 ```python
-initial_soc_frac = min(1.0, max(0.0, (epever_pct / 100.0) * 2.0 - 1.0))
+initial_soc_frac = epever_pct / 100.0   # fraction of TOTAL capacity, floor 0.50
 ```
-Where `2.0 = total_capacity / usable_capacity` (the 50% DoD ratio, same for all sites).
+With no live reading, `FALLBACK_SOC = 0.75` (75% total = half the usable range).
+SOC is tracked as a fraction of the battery's cold-derated capacity, so a full
+battery reads 100% in winter too, as on the EPEVER display.
 
 Output `soc_pct` is 0–100% of total, matching the EPEVER controller display exactly.
 
@@ -142,7 +144,7 @@ Note: voltage is `null` in all forecast rows (not available from Open-Meteo). `d
 | Bright | `pv_bright` — PV doing useful work (charging battery or serving load) |
 | Faint | `pv_faint` — PV curtailed (battery full, no load) |
 
-Total bar height always equals `pv_w` from the Python output — never exceeds it.
+Total bar height equals `pv_available`. Bright = `pv_w` (used) plus any curtailed PV a scheduled load unlocks; faint = the rest of the curtailed PV.
 
 ### Load simulation — `simulateWithLoads()`
 
