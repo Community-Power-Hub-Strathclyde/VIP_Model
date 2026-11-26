@@ -1,17 +1,18 @@
 /**
- * Classify a day as 'green' | 'amber' | 'red' for the plan week strip.
+ * Classify a day as 'green' | 'amber' | 'red' for the plan week strip,
+ * from the battery model's predicted full-charge time:
+ *   green — battery full before 12:00
+ *   amber — battery full in the afternoon
+ *   red   — battery not expected to fill that day
+ *
+ * (Previously this also tested daily_gti_kwh < 1.5, but that field is always
+ * null, and null < 1.5 is true in JavaScript, so every day came out red.)
  */
 export function classifyDay(prediction) {
-  if (!prediction) return 'red';
-  const { predicted_full_charge_time, confidence, daily_gti_kwh } = prediction;
-
-  if (!predicted_full_charge_time) return 'red';
-  if (confidence === 'low') return 'red';
-  if (daily_gti_kwh < 1.5) return 'red';
-
-  const [h] = predicted_full_charge_time.split(':').map(Number);
-  if (h < 12 && (confidence === 'high' || confidence === 'medium')) return 'green';
-  return 'amber';
+  if (!prediction?.predicted_full_charge_time) return 'red';
+  const [h] = prediction.predicted_full_charge_time.split(':').map(Number);
+  if (!Number.isFinite(h)) return 'red';
+  return h < 12 ? 'green' : 'amber';
 }
 
 /**

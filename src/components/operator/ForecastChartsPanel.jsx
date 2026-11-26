@@ -53,74 +53,47 @@ function ChartTooltip({ active, payload, label }) {
  * of the scheduled loads, then subtract that cumulative delta from the
  * Python SOC at each hour.
  *
- * Three-state controller logic for load cost per hour:
+ * How a scheduled load changes the battery, hour by hour:
  *
- *   Float mode (pythonSoc >= 99, PV was curtailed to 0):
- *     State 3 — load ≤ pvPeakW: controller ramps from float, cost = 0 Wh
- *     State 2 — load > pvPeakW: battery covers shortfall, cost = (load - pvPeak) Wh
+ *   spare PV = pv_available - pv_power_w  (solar Python curtailed because the
+ *              battery was full; zero while charging or at night)
  *
- *   Bulk mode (pythonSoc < 99, PV is actively charging):
- *     PV was going to the battery. Load redirects some/all of it.
- *     If load ≤ pvW:  PV redirected to load, battery charges less by loadW
- *     If load > pvW:  battery also discharges (load - pvW) extra
- *     Either way: battery ends up loadW Wh worse off than without the load
- *     Cost = loadW Wh
+ *   1. The load uses spare PV first — that costs the battery nothing
+ *      (the EPEVER "free energy" state when the battery is full).
+ *   2. Whatever spare PV can't cover comes out of the battery (added to the deficit).
+ *   3. Spare PV left over refills any deficit from earlier loads.
  *
- *   Night (pvW = 0, pythonSoc < 99):
- *     Battery covers everything.
- *     Cost = loadW Wh
+ * SOC is % of TOTAL capacity (EPEVER convention), so the deficit is divided by
+ * the total battery capacity, not the usable part.
  */
-function simulateWithLoads(rows, scheduledWByKey, usableCapWh, day3Date, siteCapacityKwp, siteDerating) {
-  if (!rows.length || !usableCapWh) return { socArr: [], pvUsedArr: [] };
-
-  const pvPeakW = (siteCapacityKwp ?? 5.4) * 1000 * (siteDerating ?? 0.876);
+function simulateWithLoads(rows, scheduledWByKey, totalCapWh, day3Date) {
+  if (!rows.length || !totalCapWh) return { socArr: [], pvUsedArr: [] };
 
   const socArr    = [];
   const pvUsedArr = [];
 
-  // Track cumulative battery deficit caused by loads (Wh).
-  // Deficit shrinks when PV is available (battery recharges) and
-  // resets to zero when Python says battery is full (recovered regardless).
+  // Cumulative battery deficit caused by scheduled loads (Wh)
   let cumulativeDrainWh = 0;
   let curDay = rows[0]?.date ?? '';
 
   for (const row of rows) {
     if (row.date !== curDay) {
       curDay = row.date;
+      // Python resets SOC to a fixed value from day 3, so earlier loads stop mattering
       if (row.date >= day3Date) cumulativeDrainWh = 0;
     }
 
     const key       = `${row.date}:${utcHour(row.timestamp)}`;
     const loadW     = scheduledWByKey[key] ?? 0;
-    const pvW       = row.pv_power_w ?? 0;
+    const usedW     = row.pv_power_w ?? 0;
+    const spareW    = Math.max(0, (row.pv_available_w ?? usedW) - usedW);
     const pythonSoc = row.soc ?? 50;
-    const batFull   = pythonSoc >= 99;
 
-    // Battery recharged to full — any prior deficit is gone
-    if (batFull && cumulativeDrainWh > 0) {
-      cumulativeDrainWh = 0;
-    }
+    const fromSpare = Math.min(loadW, spareW);
+    cumulativeDrainWh += loadW - fromSpare;                  // battery pays the rest
+    cumulativeDrainWh  = Math.max(0, cumulativeDrainWh - (spareW - fromSpare)); // refill
 
-    // PV recovery in bulk hours: the same PV that charges the battery
-    // also recovers the deficit from prior loads, up to pvW per hour
-    if (!batFull && pvW > 0 && cumulativeDrainWh > 0) {
-      cumulativeDrainWh = Math.max(0, cumulativeDrainWh - pvW);
-    }
-
-    // Load drain this hour
-    let hourDrainWh = 0;
-    if (loadW > 0) {
-      if (batFull) {
-        // Float: controller ramps from float to serve load from PV
-        hourDrainWh = loadW <= pvPeakW ? 0 : loadW - pvPeakW;
-      } else {
-        // Bulk or night: battery is loadW Wh worse off
-        hourDrainWh = loadW;
-      }
-      cumulativeDrainWh += hourDrainWh;
-    }
-
-    const drainPct    = (cumulativeDrainWh / usableCapWh) * 100;
+    const drainPct    = (cumulativeDrainWh / totalCapWh) * 100;
     const socWithLoad = Math.max(0, Math.min(100, pythonSoc - drainPct));
 
     socArr.push(Math.round(socWithLoad * 10) / 10);
@@ -134,8 +107,7 @@ function simulateWithLoads(rows, scheduledWByKey, usableCapWh, day3Date, siteCap
 
 
 export default function ForecastChartsPanel() {
-  const { siteData, selectedSiteName, allSites } = useSimulator();
-  const siteMeta = allSites?.find((s) => s.name === selectedSiteName);
+  const { siteData } = useSimulator();
   const { available_dates, daily_data, appliances = [] } = siteData;
 
   const [viewMode, setViewMode] = useState('7day');
@@ -161,15 +133,8 @@ export default function ForecastChartsPanel() {
 
   const effectiveDropDate = dropTargetDate ?? today;
 
-  // Battery capacity for SOC re-sim
-  const usableCapWh = useMemo(() => {
-    const cap = siteData?.physicsConstants?.batteryCapacityWh;
-    if (cap) return cap * 0.8;
-    // Fall back to allSites meta
-    const meta = allSites?.find((s) => s.name === selectedSiteName);
-    if (meta?.capacity_kwp) return meta.capacity_kwp * 1000 * 0.5; // rough estimate
-    return 7680; // CP2 default
-  }, [siteData, allSites, selectedSiteName]);
+  // Total battery capacity (Wh) — SOC % is a share of total, EPEVER convention
+  const totalCapWh = siteData?.physicsConstants?.batteryCapacityWh ?? 9600;
 
   // Collapse scheduled to { "date:hour": totalW } for chart sim
   const scheduledWByKey = useMemo(() => {
@@ -198,49 +163,31 @@ export default function ForecastChartsPanel() {
       return { socWithLoad: [], pvUsedWithLoad: [] };
     }
     const { socArr, pvUsedArr } = simulateWithLoads(
-      allRows, scheduledWByKey, usableCapWh, day3Date,
-      siteMeta?.capacity_kwp, siteMeta?.system_derating
+      allRows, scheduledWByKey, totalCapWh, day3Date
     );
     return { socWithLoad: socArr, pvUsedWithLoad: pvUsedArr };
-  }, [allRows, scheduledWByKey, usableCapWh, day3Date, hasLoads, siteMeta]);
+  }, [allRows, scheduledWByKey, totalCapWh, day3Date, hasLoads]);
 
   // Chart data — simple stacked bar logic:
   //   pv_bright: PV that is DOING something useful (charging battery OR serving load) → bright
   //   pv_faint:  PV that is wasted / curtailed (battery full, no load) → faint
-  //   Total bar height = pv_bright + pv_faint = pv_w always (never exceeds Python output)
+  //   Total bar height = pv_available (what the panels could deliver)
   //
-  // With loads scheduled:
-  //   During bulk charging: load is served from PV (reduces charge rate), bar stays bright
-  //   During float (SOC=100%): load unlocks curtailed PV → faint portion becomes bright
-  //   At night: load drains battery, SOC drops — bar stays at 0W (no PV)
+  // Python now models curtailment: pv_w is the PV actually used (load + charging)
+  // and pv_available is the uncurtailed maximum. The gap is curtailed PV.
+  // A scheduled load unlocks curtailed PV up to its own size: that part turns bright.
   const chartData = useMemo(() =>
     allRows.map((row, i) => {
-      const pvW       = row.pv_power_w ?? 0;
+      const usedW     = row.pv_power_w ?? 0;
+      const availW    = Math.max(usedW, row.pv_available_w ?? usedW);
       const pythonSoc = row.soc ?? 50;
-      const isFull    = pythonSoc >= 99;
       const key       = `${row.date}:${utcHour(row.timestamp)}`;
       const loadW     = scheduledWByKey[key] ?? 0;
 
-      // How much of pvW is serving a useful purpose (bright)?
-      // Bulk: all PV is bright (going to battery or load)
-      // Float + no load: PV is curtailed → faint
-      // Float + load: up to loadW of PV becomes bright (load unlocks it), rest faint
-      let pv_bright, pv_faint;
-
-      if (!isFull) {
-        // Bulk charging — all PV is useful
-        pv_bright = pvW;
-        pv_faint  = 0;
-      } else if (loadW > 0) {
-        // Float + load: load unlocks curtailed PV, show that portion as bright
-        // Bar height stays = pvW (we don't add phantom PV above what Python reported)
-        pv_bright = Math.min(pvW, loadW);
-        pv_faint  = Math.max(0, pvW - loadW);
-      } else {
-        // Float, no load: all PV curtailed → faint
-        pv_bright = 0;
-        pv_faint  = pvW;
-      }
+      const spareW    = availW - usedW;             // curtailed by Python
+      const unlockedW = Math.min(spareW, loadW);    // a scheduled load uses some of it
+      const pv_bright = usedW + unlockedW;
+      const pv_faint  = spareW - unlockedW;
 
       return {
         label: viewMode === 'today'

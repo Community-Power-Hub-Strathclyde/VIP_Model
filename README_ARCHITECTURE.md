@@ -93,8 +93,10 @@ Processes each site in sequence through 9 blocks:
 ```
 
 Key fields:
-- `pv_w` — curtailed PV output (0 when battery is full and controller is in float)
-- `pv_available` — uncurtailed estimate of what the array could produce
+- `pv_w` — PV actually used (load + battery charging). Drops once the battery is full and the controller curtails
+- `pv_available` — uncurtailed estimate of what the array could produce; `pv_available − pv_w` is curtailed solar
+- daily `gen_kwh` = solar used; daily `available_kwh` = solar possible (drives `weather_icon`)
+- `soc_source` — `api`, `api_shared` (station reading shared by two controllers; set `solar_guardian_device`) or `fallback`
 - `soc_pct` — 0–100% of total battery capacity, matching the EPEVER display exactly
 - `weather_icon` — `sunny | partly_cloudy | cloudy | overcast`
 

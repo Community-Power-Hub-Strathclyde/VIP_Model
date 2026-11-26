@@ -128,7 +128,7 @@ Python is the single source of truth for all physics. React is a pure display la
 | Stage | What it does |
 |---|---|
 | Site config | Panel, battery, and inverter specs per site |
-| Solar Guardian API | Fetches live battery SOC; falls back to 50% if unavailable |
+| Solar Guardian API | Fetches live battery SOC per controller (needs `SG_APP_KEY` / `SG_APP_SECRET`); falls back to 75% if unavailable |
 | Weather | Open-Meteo 7-day forecast with `past_days=1` |
 | GTI transposition | Isotropic sky model, solar geometry, bifacial gain |
 | PV model | NOCT cell temp → temperature derate → DC power → system derating → MPPT clip → inverter |
@@ -155,10 +155,13 @@ EPEVER 50%  →  0% usable  (DoD floor)
 EPEVER 100% →  100% usable (fully charged)
 ```
 
-Seeding formula:
+Seeding:
 ```python
-initial_soc_frac = min(1.0, max(0.0, (epever_pct / 100.0) * 2.0 - 1.0))
+initial_soc_frac = epever_pct / 100.0   # fraction of TOTAL capacity, floor 0.50
 ```
+With no live reading, `FALLBACK_SOC = 0.75` (75% total = half the usable range).
+SOC is tracked as a fraction of the battery's cold-derated capacity, so a full
+battery reads 100% in winter too, as on the EPEVER display.
 
 ### System derating
 

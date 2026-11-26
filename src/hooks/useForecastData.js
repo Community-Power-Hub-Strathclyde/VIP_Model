@@ -63,7 +63,10 @@ function toPrediction(simDaily) {
   if (!simDaily) return null;
 
   const icon       = simDaily.weather_icon ?? 'overcast';
-  const fullCharge = simDaily.full_charge_time ?? simDaily.fc_model_time ?? null;
+  // Full-charge time comes from the battery model only. The regression estimate
+  // (fc_model_time) gives a time even on days the battery never fills, which
+  // contradicts the battery chart, so it is kept separately for operators.
+  const fullCharge = simDaily.full_charge_time ?? null;
 
   // Parse full_charge_time string ("14:30") → decimal hour (14.5) for energyCalc
   let prediction_hour = null;
@@ -86,8 +89,10 @@ function toPrediction(simDaily) {
       ? `Predicted full charge around ${fullCharge}.`
       : 'No full charge predicted today.',
     prediction_hour,
+    regression_full_charge_time: simDaily.fc_model_time ?? null,
     daily_gti_kwh:              null,
-    gen_kwh:                    simDaily.gen_kwh ?? null,
+    gen_kwh:                    simDaily.gen_kwh ?? null,       // solar used
+    available_kwh:              simDaily.available_kwh ?? null, // solar possible
     isForecast:                 true,
   };
 }
